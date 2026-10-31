@@ -17,7 +17,8 @@ from .common import (
     save_rows,
     plot_csv,
 )
-from .method import PrototypeVerifier, VARIANTS
+from .metrics import selection_metrics, summarize_seeds
+from .method import PrototypeVerifier, FreeMatchSelector, VARIANTS
 
 
 def split_indices(dataset, config):
@@ -81,6 +82,9 @@ def train(config):
         device_of(config)
     )
     initialize_verifier(model, dataset, labeled, verifier, config)
+    freematch = FreeMatchSelector(len(dataset.classes), config["beta"]).to(
+        device_of(config)
+    )
     optimizer = torch.optim.SGD(
         model.parameters(),
         lr=config["lr"],
@@ -99,7 +103,12 @@ def train(config):
     for epoch in range(config["epochs"]):
         model.train()
         losses, acceptance = [], []
-        warmup = epoch < config["warmup_epochs"]
+        warmup = epoch < config["warmup_epochs"] and config["variant"] not in [
+            "fixmatch",
+            "pseudo_label",
+            "freematch",
+            "supervised",
+        ]
         for _ in range(per_epoch):
             chosen, x, _ = draw(dataset, labeled, config["batch_size"], rng)
             _, weak, strong = draw(
@@ -118,6 +127,8 @@ def train(config):
             pseudo_labels, mask, _, _ = verifier.select(
                 weak_logits.detach(), weak_features.detach(), config["variant"]
             )
+            if config["variant"] == "freematch":
+                pseudo_labels, mask = freematch.select(weak_logits, update=True)
             if warmup:
                 mask.zero_()
             supervised = F.cross_entropy(labeled_logits, y)
@@ -136,13 +147,20 @@ def train(config):
             if config["variant"] in [
                 "protoverify",
                 "prototype_only",
-                "confidence_only",
+                "fixed_prototype",
+                "similarity_only",
             ]:
                 prototype = verifier.prototype_loss(labeled_features, y)
+            fairness = (
+                freematch.fairness_loss(student_logits, mask)
+                if config["variant"] == "freematch"
+                else supervised.new_zeros(())
+            )
             loss = (
                 supervised
                 + config["lambda_u"] * unsupervised
                 + config["lambda_p"] * prototype
+                + config.get("lambda_e", 0.01) * fairness
             )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -180,6 +198,7 @@ def train(config):
         {
             "model": model.state_dict(),
             "verifier": verifier.state_dict(),
+            "freematch": freematch.state_dict(),
             "labeled": labeled,
             "unlabeled": unlabeled,
             "classes": dataset.classes,
@@ -209,6 +228,11 @@ def evaluate(config):
         device_of(config)
     )
     verifier.load_state_dict(state["verifier"])
+    freematch = FreeMatchSelector(len(state["classes"]), trained["beta"]).to(
+        device_of(config)
+    )
+    if "freematch" in state:
+        freematch.load_state_dict(state["freematch"])
     model.eval()
     test_accuracy = accuracy(model, Images(config, "test"), config)
     dataset = Images(config, "train")
@@ -228,6 +252,9 @@ def evaluate(config):
             labels, mask, conf, proto = verifier.select(
                 logits, features, trained["variant"]
             )
+            if trained["variant"] == "freematch":
+                labels, mask = freematch.select(logits, update=False)
+                conf = mask
             labels, mask = labels.cpu().numpy(), mask.cpu().numpy()
             ground_truth = dataset.labels[batch]
             accepted += int(mask.sum())
@@ -249,10 +276,12 @@ def evaluate(config):
         "variant": trained["variant"],
         "seed": trained["seed"],
         "accuracy": test_accuracy,
-        "pseudo_label_accuracy": 100 * correct / accepted if accepted else None,
-        "utilization": 100 * accepted / total,
-        "acceptance_cv": float(counts.std() / counts.mean()) if accepted else None,
-        "accepted": accepted,
+        **selection_metrics(
+            [r["prediction"] for r in diagnostics],
+            [r["label"] for r in diagnostics],
+            [r["accepted"] for r in diagnostics],
+            len(state["classes"]),
+        ),
     }
     save_json(Path(config["output"]) / "metrics.json", summary)
     save_rows(Path(config["output"]) / "selection.csv", diagnostics)
@@ -277,6 +306,7 @@ def compare(config):
             current["checkpoint"] = train(current)
             rows.append(evaluate(current))
     save_rows(Path(config["output"]) / "comparison.csv", rows)
+    save_json(Path(config["output"]) / "summary.json", summarize_seeds(rows))
 
 
 def main():

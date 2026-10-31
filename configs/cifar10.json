@@ -32,10 +32,12 @@
     "supervised",
     "pseudo_label",
     "fixmatch",
+    "freematch",
     "confidence_only",
-    "prototype_only",
-    "no_prototype_loss",
-    "protoverify"
+    "fixed_prototype",
+    "similarity_only",
+    "protoverify",
+    "no_prototype_loss"
   ],
   "seed": 2026,
   "seeds": [
@@ -47,5 +49,6 @@
   "limit": 0,
   "max_steps": 0,
   "workers": 0,
-  "threads": 4
+  "threads": 4,
+  "lambda_e": 0.01
 }

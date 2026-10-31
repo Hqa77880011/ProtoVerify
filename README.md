@@ -49,6 +49,28 @@ python -m protoverify plot --config configs/cifar10.json --output outputs/compar
 
 Run directories contain `model.pt`, `history.csv`, `metrics.json`, `selection.csv`, `class_acceptance.csv` as produced by the corresponding steps. `config.json` records effective settings. Comparison results are in `outputs/comparison/comparison.csv`; plotting reads those computed files.
 
-## Verification
+## Protocol, controls and verification
 
-Source checks used Python 3.13.5. Installed dependency metadata: numpy 2.1.3, torch 2.7.1+cu118, torchvision 0.22.1, matplotlib 3.10.0. Python AST, configuration files, CLI parser definitions and source input/output paths were checked without invoking command handlers. Training, full evaluation and CI were not run for this review.
+`confidence_only` is CAT-only. `fixed_prototype` keeps the fixed confidence threshold and the full prototype rule. `similarity_only` removes nearest-prototype agreement while retaining the class-adaptive confidence gate. `prototype_only` is an additional diagnostic that drops confidence entirely; it is not the paper's fixed-prototype row. `no_prototype_loss` retains the dual selection while removing the labeled prototype objective.
+
+`freematch` is a single-process SAT/SAF adaptation based on [Microsoft USB's FreeMatch implementation](https://github.com/microsoft/Semi-supervised-learning/tree/main/semilearn/algorithms/freematch): mean-confidence EMA, class-probability modulation, prediction-histogram adjustment and the entropy objective (`lambda_e=0.01`). Its own buffers update before training selection; evaluation freezes them. It uses this repository's backbone, augmentation, optimizer and final-checkpoint protocol rather than claiming an upstream benchmark reproduction. FixMatch/Pseudo-Label/FreeMatch start unlabeled learning immediately; prototype variants use the configured prototype warm-up.
+
+The 5,000-image validation reserve is taken from the official training pool. This is an explicit implementation choice beyond the paper's unspecified model-selection partition; the remaining pool supplies the class-balanced 250 labels and unlabeled examples. Test labels never enter fitting. CIFAR normalization constants are fixed. Other unspecified choices are `gamma=0.2`, `eta=1`, cosine bounds `[0.2,0.95]`, prototype temperature `0.1`, RandAugment `(2,10)`, SGD/cosine schedule and the config's 200 epochs. These choices are not recovered paper experiment settings.
+
+`compare` writes per-seed `comparison.csv` and `summary.json`. Means give each independently trained seed equal weight. Accuracy SD is the sample SD across training seeds, unavailable with one seed. PL accuracy is correct accepted predictions / accepted predictions; utilization is accepted / unlabeled pool (both percent); acceptance CV uses the population SD of the K accepted class counts divided by their mean. An empty accepted set has null PL accuracy/CV. Hidden unlabeled labels enter this final-checkpoint diagnostic only.
+
+| Paper module or metric | Entry | Command/settings |
+|---|---|---|
+| Balanced labels, weak/strong views, WRN-28-2 | `cli.split_indices/draw`, `common.FeatureNet` | `prepare`, `train`, `configs/cifar10.json` |
+| Delayed CAT/prototype gates and labeled prototype loss | `method.PrototypeVerifier` | `tau0=0.95`, `beta=0.999`, `mu=0.99`, `lambda_p=0.1`, warm-up 10 |
+| Baselines and component removals | `VARIANTS`, `FreeMatchSelector`, `cli.train` | `compare`, `--variant fixed_prototype/similarity_only/freematch` |
+| Accuracy, PL precision/utilization/CV; seed means/SD | `cli.evaluate`, `metrics` | `evaluate`, `compare` |
+| Training/seed visualization | `common.plot_csv` | `plot` |
+
+```bash
+python tests/smoke.py
+```
+
+Actually passed on Windows, Python 3.13.5, torch 2.7.1+cu118 (CPU), torchvision 0.22.1 and NumPy 2.1.3: file-backed image preparation, balanced disjoint splits, two SSL optimizer steps, finite nonzero encoder/classifier gradients and updates, detached delayed buffers, exact eval checkpoint agreement, prototype ablations, SAT/SAF gradients, hand-counted selection metrics and seed SD, evaluation and plotting. Seed 71 fixes fixtures; the two-step training uses config seed 2026. Outputs stay in ignored `outputs/smoke/`.
+
+The core model/gates/CLI predate this revision. This revision adds the missing fixed-prototype and similarity-only controls, an explicit FreeMatch adaptation, seed aggregation, correct baseline warm-up scope and executable verification. Synthetic checks establish functionality only. Full CIFAR-10 training, FreeMatch convergence and the paper's reported performance were not rerun; no performance table is populated from fixtures.

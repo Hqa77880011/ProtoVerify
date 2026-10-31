@@ -7,6 +7,9 @@ VARIANTS = [
     "supervised",
     "pseudo_label",
     "fixmatch",
+    "freematch",
+    "fixed_prototype",
+    "similarity_only",
     "confidence_only",
     "prototype_only",
     "no_prototype_loss",
@@ -44,15 +47,20 @@ class PrototypeVerifier(nn.Module):
             self.config["tau0"]
             + self.config["gamma"] * (self.confidence - self.confidence.mean())
         ).clamp(self.config["tau_min"], self.config["tau_max"])
-        if variant in ["fixmatch", "pseudo_label"]:
+        if variant in ["fixmatch", "pseudo_label", "fixed_prototype"]:
             thresholds = torch.full_like(thresholds, self.config["tau0"])
         confidence_mask = confidence >= thresholds[labels]
         similarities = F.normalize(features, dim=1) @ self.prototypes.T
         boundary = (
             self.similarity_mean - self.config["eta"] * self.similarity_std
         ).clamp(self.config["delta_min"], self.config["delta_max"])
-        prototype_mask = (similarities.argmax(1) == labels) & (
+        similarity_mask = (
             similarities.gather(1, labels[:, None]).squeeze(1) >= boundary[labels]
+        )
+        prototype_mask = (
+            similarity_mask
+            if variant == "similarity_only"
+            else (similarities.argmax(1) == labels) & similarity_mask
         )
         if variant == "supervised":
             mask = torch.zeros_like(confidence_mask)
@@ -114,3 +122,48 @@ class PrototypeVerifier(nn.Module):
             / self.config["temperature"]
         )
         return F.cross_entropy(logits, labels)
+
+
+class FreeMatchSelector(nn.Module):
+    """Single-process SAT/SAF baseline following Microsoft USB FreeMatch.
+
+    This state is independent of ProtoVerify's delayed prototype buffers.
+    The mean-confidence threshold is updated before training selection.
+    """
+
+    def __init__(self, classes, momentum=0.999):
+        super().__init__()
+        self.momentum = momentum
+        self.register_buffer("probability", torch.full((classes,), 1 / classes))
+        self.register_buffer("histogram", torch.full((classes,), 1 / classes))
+        self.register_buffer("threshold", torch.tensor(1 / classes))
+
+    @torch.no_grad()
+    def select(self, logits, update=False):
+        probabilities = logits.detach().softmax(1)
+        confidence, labels = probabilities.max(1)
+        if update:
+            m = self.momentum
+            self.threshold.mul_(m).add_(confidence.mean(), alpha=1 - m)
+            self.probability.mul_(m).add_(probabilities.mean(0), alpha=1 - m)
+            histogram = torch.bincount(labels, minlength=len(self.probability)).to(
+                probabilities
+            )
+            self.histogram.mul_(m).add_(histogram / histogram.sum(), alpha=1 - m)
+        boundary = self.threshold * self.probability / self.probability.max()
+        return labels, confidence >= boundary[labels]
+
+    def fairness_loss(self, logits, mask):
+        if not mask.any():
+            return logits.sum() * 0
+        probabilities = logits[mask].softmax(1)
+        histogram = torch.bincount(
+            probabilities.argmax(1), minlength=logits.shape[1]
+        ).to(logits)
+        histogram /= histogram.sum()
+        target = self.probability.detach() / self.histogram.detach().clamp_min(1e-12)
+        target /= target.sum()
+        inverse = torch.where(histogram > 0, 1 / histogram.clamp_min(1e-12), 0)
+        adjusted = probabilities.mean(0) * inverse.detach()
+        adjusted /= adjusted.sum()
+        return (target * (adjusted + 1e-12).log()).sum()
